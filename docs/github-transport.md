@@ -38,7 +38,7 @@ and how the sender knows when to proceed:
 | | `github` (ACK-based) | `github_commit` (commit messages) |
 |---|---|---|
 | Config value | `transport: github` | `transport: github_commit` |
-| Data lives in | File content | Commit message |
+| Data lives in | File content | Commit message (≤ 60 KB) |
 | Receiver discovers data by | Polling file content | Polling commit list (data included) |
 | Sender waits for | Receiver to ACK (reset file to sentinel) | Nothing — returns after PUT |
 | API calls per hop | 6 (4 GET + 2 PUT) | **2** (1 GET + 1 PUT) |
@@ -408,17 +408,22 @@ a tiny nonce (an incrementing counter) that changes each time so the
 blob SHA advances and the PUT always succeeds. The real data lives
 in the commit message.
 
+**Size limit:** GitHub truncates commit messages at 65 535 characters. The
+transport enforces a hard limit of 60 000 bytes per encoded batch. Batches
+that exceed this are rejected with an error. In practice the coalescing
+window (200 ms default) keeps batches well under this limit — a typical
+TCP segment is 1–16 KB.
+
 ## Why This Is Faster
 
-| | `github` (ACK) | `github_commit` (old, file-based) | `github_commit` (current, message-based) |
-|---|---|---|---|
-| API calls/hop | 6 | 3 | **2** |
-| Receiver GETs/hop | 3 | 2 (listCommits + getFileAt) | **1** (listCommits only) |
-| N commits in one poll | N/A | 1 + N GETs | **1 GET for all N** |
+| | `github` (ACK) | `github_commit` (commit messages) |
+|---|---|---|
+| API calls/hop | 6 | **2** |
+| Receiver GETs/hop | 3 | **1** (listCommits only) |
+| N commits in one poll | N/A | **1 GET for all N** |
 
-When 5 commits pile up between polls, the old approach needed 6 GETs
-(1 listCommits + 5 getFileAt). This approach needs just 1 GET — all 5
-commit messages are already in the response.
+When 5 commits pile up between polls, the receiver gets all 5 in a single
+`listCommits` GET — the commit messages are already in the JSON response.
 
 ## Send Flow (step by step)
 
@@ -439,7 +444,11 @@ commit messages are already in the response.
 4. WRITE THROTTLE
    If < 1.1 s since last PUT, sleep the remainder.
 
-5. PUT
+5. SIZE CHECK
+   If len(encoded) > 60 000 bytes → error (batch too large).
+   In practice this never happens at default settings.
+
+6. PUT
    PUT SendFile:
      { "message": "<!-- pwn:data -->\n<base64-encoded batch>",
        "content": base64("<nonce>"),          ← tiny counter, e.g. "1", "2", "3"
@@ -457,8 +466,9 @@ commit messages are already in the response.
    On other error: sleep, retry up to max_retries.
 ```
 
-**That's it.** 5 steps. No ACK, no waitReady. The commit message
-carries the data; the file content is just a nonce to keep git happy.
+**That's it.** No ACK, no waitReady, no file-content fallback. The
+commit message carries the data; the file content is just a nonce to
+keep git happy.
 
 ## Receive Flow (step by step)
 
@@ -511,8 +521,8 @@ carries the data; the file content is just a nonce to keep git happy.
    │       a. Read commit.message from the JSON           │
    │          (already in hand — no extra API call!)      │
    │                                                      │
-   │       b. If message doesn't start with dataPrefix:   │
-   │          skip (manual commit, init, etc).            │
+   │       b. If message doesn't start with dataPrefix    │
+   │          → skip (manual commit, init, etc).          │
    │                                                      │
    │       c. Strip prefix, base64-decode, unmarshal.     │
    │          Deliver each packet to the tunnel.          │
@@ -732,4 +742,4 @@ All durations accept Go's time syntax: `500ms`, `1s`, `2m`, etc.
 | Rate limit | 5 000 req/hr; 304s are cheap | 5 000 req/hr; 304s are cheap |
 | API calls per hop | 5–6 | **2** |
 | Latency per hop | ~3–5 s | **~1.5–2.5 s** |
-| Max payload/batch | ~1 MB (Contents API GET limit) | ~64 KB (commit message limit) |
+| Max payload/batch | ~1 MB (Contents API GET limit) | 60 KB (commit message limit) |

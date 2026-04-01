@@ -7,6 +7,7 @@
 //	go run ./cmd/client -listen :8080            # override listen address
 //	go run ./cmd/client -transport github        # use ACK-based GitHub transport
 //	go run ./cmd/client -transport github_commit # use commit-based GitHub transport
+//	go run ./cmd/client -transport gitlab        # use GitLab commit transport
 package main
 
 import (
@@ -18,16 +19,17 @@ import (
 	"pwn/internal/proxy"
 	"pwn/internal/transport"
 	transportgithub "pwn/internal/transport/github"
+	transportgitlab "pwn/internal/transport/gitlab"
 	"pwn/internal/tunnel"
 )
 
 func main() {
-	cfgFile    := flag.String("config",    "config.yaml", "path to YAML config file")
-	fListen    := flag.String("listen",    "",            "override client.listen")
-	fTransport := flag.String("transport", "",            "override transport: github | github_commit")
-	fCodec     := flag.String("codec",     "",            "override codec: base64 | raw")
-	fTimeout   := flag.Duration("timeout", 0,             "override client.timeout")
-	fDebug     := flag.Bool("debug",       false,         "enable debug logging")
+	cfgFile := flag.String("config", "config.yaml", "path to YAML config file")
+	fListen := flag.String("listen", "", "override client.listen")
+	fTransport := flag.String("transport", "", "override transport: github | github_commit | gitlab")
+	fCodec := flag.String("codec", "", "override codec: base64 | raw")
+	fTimeout := flag.Duration("timeout", 0, "override client.timeout")
+	fDebug := flag.Bool("debug", false, "enable debug logging")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgFile)
@@ -37,11 +39,16 @@ func main() {
 
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "listen":    cfg.Client.Listen = *fListen
-		case "transport": cfg.Transport = *fTransport
-		case "codec":     cfg.Codec = *fCodec
-		case "timeout":   cfg.Client.Timeout = config.Duration{Duration: *fTimeout}
-		case "debug":     cfg.Debug = *fDebug
+		case "listen":
+			cfg.Client.Listen = *fListen
+		case "transport":
+			cfg.Transport = *fTransport
+		case "codec":
+			cfg.Codec = *fCodec
+		case "timeout":
+			cfg.Client.Timeout = config.Duration{Duration: *fTimeout}
+		case "debug":
+			cfg.Debug = *fDebug
 		}
 	})
 
@@ -108,8 +115,34 @@ func buildTransport(cfg *config.Config, codec transport.Codec, clientSide bool) 
 			cfg.GitHub.CoalesceWindow, cfg.GitHub.PollInterval)
 		return tp
 
+	case "gitlab":
+		sendFile, recvFile := cfg.GitLab.UpFile, cfg.GitLab.DownFile
+		sendBranch, recvBranch := cfg.GitLab.EffectiveUpBranch(), cfg.GitLab.EffectiveDownBranch()
+		if !clientSide {
+			sendFile, recvFile = cfg.GitLab.DownFile, cfg.GitLab.UpFile
+			sendBranch, recvBranch = recvBranch, sendBranch
+		}
+		glCfg := transportgitlab.Config{
+			BaseURL:        cfg.GitLab.BaseURL,
+			Project:        cfg.GitLab.Project,
+			Token:          cfg.GitLab.Token,
+			SendFile:       sendFile,
+			RecvFile:       recvFile,
+			SendBranch:     sendBranch,
+			RecvBranch:     recvBranch,
+			CoalesceWindow: cfg.GitLab.CoalesceWindow.Duration,
+			PollInterval:   cfg.GitLab.PollInterval.Duration,
+			MaxRetries:     cfg.GitLab.MaxRetries,
+		}
+		log.Printf("[%s] gitlab  project=%s  up=%s@%s  down=%s@%s  coalesce=%s  poll=%s",
+			side(clientSide),
+			cfg.GitLab.Project,
+			sendFile, sendBranch, recvFile, recvBranch,
+			cfg.GitLab.CoalesceWindow, cfg.GitLab.PollInterval)
+		return transportgitlab.New(glCfg, codec)
+
 	default:
-		log.Fatalf("unknown transport %q – supported: github, github_commit", cfg.Transport)
+		log.Fatalf("unknown transport %q – supported: github, github_commit, gitlab", cfg.Transport)
 		return nil
 	}
 }

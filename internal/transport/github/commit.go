@@ -1,7 +1,7 @@
 // Package github CommitTransport tunnels packets through the commit history of two files
 // in a GitHub repository using the GitHub Contents API.
 //
-// # Protocol — commit messages as the data channel (with file-content fallback)
+// # Protocol — commit messages as the data channel
 //
 // The sender encodes the packet batch and writes it as the git **commit
 // message**.  The file content is a small nonce that changes each time so
@@ -10,23 +10,19 @@
 // response — so it gets all pending data in a **single GET**, without any
 // per-commit file fetches.
 //
-// GitHub truncates commit messages at 65 535 characters.  When the encoded
-// batch exceeds maxMsgPayload (60 000 bytes), the sender puts the data into
-// the **file content** instead and writes a short marker ("<!-- pwn:file -->")
-// as the commit message.  The receiver detects this marker and falls back
-// to a getFileAt call for that specific commit SHA.
+// GitHub truncates commit messages at 65 535 characters.  The transport
+// enforces a maxMsgPayload of 60 000 bytes; batches that exceed this limit
+// are rejected with an error.  In practice this is never hit because the
+// coalescing window keeps batches small.
 //
 // # Send flow
 //
 //  1. Coalesce packets for CoalesceWindow (200 ms default).
 //  2. Marshal & encode the batch.
-//  3. If len(encoded) ≤ maxMsgPayload → "message path":
+//  3. Build commit:
 //     - message: "<!-- pwn:data -->\n<base64>"    ← the actual data
 //     - content: "<nonce>"                         ← advance blob SHA
-//  4. If len(encoded) > maxMsgPayload → "file path":
-//     - message: "<!-- pwn:file -->"               ← marker
-//     - content: "<!-- pwn:data -->\n<base64>"     ← the actual data
-//  5. Send() returns as soon as the PUT succeeds.  No ACK wait.
+//  4. Send() returns as soon as the PUT succeeds.  No ACK wait.
 //
 // # Receive flow
 //
@@ -36,18 +32,13 @@
 //  3. Find commits newer than the cursor.
 //  4. For each new commit (oldest first):
 //     a. If commit.message starts with dataPrefix → decode from message.
-//     b. If commit.message == dataFileMarker → getFileAt(commit SHA),
-//        then decode from file content.
-//     c. Otherwise → skip (not our commit).
+//     b. Otherwise → skip (not our commit).
 //
 // # Performance
 //
-//	API calls per hop (small batches):
+//	API calls per hop:
 //	  GitHubTransport:   6  (4 GET + 2 PUT)
 //	  CommitTransport:   2  (1 GET + 1 PUT)
-//
-//	API calls per hop (large batches, file fallback):
-//	  CommitTransport:   3  (1 GET + 1 PUT + 1 GET for file)
 //
 //	Latency per hop: ~1.5–2.5 s  (coalesce + throttle + PUT + poll)
 package github
@@ -64,16 +55,10 @@ import (
 	"pwn/internal/transport"
 )
 
-const (
-	// maxMsgPayload is the maximum encoded payload (bytes) that fits in a
-	// commit message.  GitHub truncates messages at 65 535 characters; we
-	// leave headroom for the dataPrefix and rounding.
-	maxMsgPayload = 60000
-
-	// dataFileMarker is the commit message used when the encoded batch is
-	// too large for the message and has been placed in the file content.
-	dataFileMarker = "<!-- pwn:file -->"
-)
+// maxMsgPayload is the maximum encoded payload (bytes) that fits in a
+// commit message.  GitHub truncates messages at 65 535 characters; we
+// leave headroom for the dataPrefix and rounding.
+const maxMsgPayload = 60_000
 
 // CommitTransport implements transport.Transport via two GitHub repository
 // files using commit messages as the data channel.
@@ -195,18 +180,13 @@ func (t *CommitTransport) sendBatch(jobs []*sendJob, done <-chan struct{}) error
 		return fmt.Errorf("encode: %w", err)
 	}
 
-	// Decide where the encoded data lives: commit message (fast) or file
-	// content (fallback for payloads that exceed GitHub's 65 535-char limit).
-	var commitMessage, fileContent string
-	t.sendSeq++
-	if len(encoded) <= maxMsgPayload {
-		commitMessage = dataPrefix + string(encoded)
-		fileContent = strconv.FormatUint(t.sendSeq, 10)
-	} else {
-		commitMessage = dataFileMarker
-		fileContent = dataPrefix + string(encoded)
-		log.Debug("commit-send  large payload (%d bytes) → file content", len(encoded))
+	if len(encoded) > maxMsgPayload {
+		return fmt.Errorf("batch too large for commit message (%d bytes, max %d)", len(encoded), maxMsgPayload)
 	}
+
+	t.sendSeq++
+	commitMessage := dataPrefix + string(encoded)
+	fileContent := strconv.FormatUint(t.sendSeq, 10)
 
 	if t.sendBlobSHA == "" {
 		if err := t.initSendBlobSHA(); err != nil {
@@ -340,25 +320,11 @@ func (t *CommitTransport) tryRecvCommits(ch chan<- *packet.Packet, done <-chan s
 
 		t.recvLastCommitSHA = c.SHA
 
-		var encoded []byte
 		msg := c.Commit.Message
-		switch {
-		case strings.HasPrefix(msg, dataPrefix):
-			encoded = []byte(strings.TrimPrefix(msg, dataPrefix))
-		case msg == dataFileMarker:
-			content, _, _, ferr := t.getFileAt(t.cfg.RecvFile, c.SHA, "")
-			if ferr != nil {
-				log.Error("commit-recv getFileAt commit=%s: %v", shortSHA(c.SHA), ferr)
-				continue
-			}
-			if !strings.HasPrefix(content, dataPrefix) {
-				continue
-			}
-			encoded = []byte(strings.TrimPrefix(content, dataPrefix))
-			log.Debug("commit-recv  commit=%s  large payload from file (%d bytes)", shortSHA(c.SHA), len(encoded))
-		default:
+		if !strings.HasPrefix(msg, dataPrefix) {
 			continue
 		}
+		encoded := []byte(strings.TrimPrefix(msg, dataPrefix))
 
 		raw, err := t.codec.Decode(encoded)
 		if err != nil {

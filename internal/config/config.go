@@ -30,7 +30,10 @@ func (d Duration) MarshalYAML() (interface{}, error) { return d.String(), nil }
 
 // Config is the top-level structure read by both the client and server.
 type Config struct {
-	// Transport selects the carrier: "github" or "github_commit" (default).
+	// Transport selects the carrier:
+	//   "github"        – GitHub Contents API, ACK-based
+	//   "github_commit" – GitHub Contents API, commit-history queue (default)
+	//   "gitlab"        – GitLab Repository Files + Commits API
 	Transport string `yaml:"transport"`
 	// Codec is the wire encoding shared by both sides: "base64" or "raw".
 	Codec string `yaml:"codec"`
@@ -38,6 +41,7 @@ type Config struct {
 	Debug bool `yaml:"debug"`
 
 	GitHub GitHubConfig `yaml:"github"`
+	GitLab GitLabConfig `yaml:"gitlab"`
 	Client ClientConfig `yaml:"client"`
 	Server ServerConfig `yaml:"server"`
 }
@@ -109,6 +113,61 @@ func (g GitHubConfig) EffectiveSendTimeout(fallback Duration) time.Duration {
 	return fallback.Duration
 }
 
+// GitLabConfig describes the GitLab project used by the GitLab transport.
+type GitLabConfig struct {
+	// BaseURL is the GitLab instance root URL.
+	// Defaults to "https://gitlab.com". Override for self-hosted instances.
+	BaseURL string `yaml:"base_url"`
+
+	// Project is the namespace/project path (e.g. "joejoe/fun-net") or the
+	// numeric project ID (e.g. "12345").
+	Project string `yaml:"project"`
+
+	// Token is a GitLab Personal Access Token with api scope.
+	Token string `yaml:"token"`
+
+	// Branch is the default branch used when up_branch/down_branch are empty.
+	Branch string `yaml:"branch"`
+	// UpBranch is the branch for client→server commits. Falls back to Branch.
+	UpBranch string `yaml:"up_branch"`
+	// DownBranch is the branch for server→client commits. Falls back to Branch.
+	DownBranch string `yaml:"down_branch"`
+
+	// UpFile is the repo-relative path for client→server data.
+	UpFile string `yaml:"up_file"`
+	// DownFile is the repo-relative path for server→client data.
+	DownFile string `yaml:"down_file"`
+
+	// CoalesceWindow is how long to accumulate packets before flushing.
+	CoalesceWindow Duration `yaml:"coalesce_window"`
+	// PollInterval is how often to check for incoming data. Default: 2s.
+	PollInterval Duration `yaml:"poll_interval"`
+
+	MaxRetries int `yaml:"max_retries"`
+}
+
+// EffectiveUpBranch returns UpBranch, falling back to Branch, then "main".
+func (g GitLabConfig) EffectiveUpBranch() string {
+	if g.UpBranch != "" {
+		return g.UpBranch
+	}
+	if g.Branch != "" {
+		return g.Branch
+	}
+	return "main"
+}
+
+// EffectiveDownBranch returns DownBranch, falling back to Branch, then "main".
+func (g GitLabConfig) EffectiveDownBranch() string {
+	if g.DownBranch != "" {
+		return g.DownBranch
+	}
+	if g.Branch != "" {
+		return g.Branch
+	}
+	return "main"
+}
+
 // ClientConfig holds settings for the client (SOCKS5 proxy) side.
 type ClientConfig struct {
 	Listen  string   `yaml:"listen"`
@@ -142,6 +201,15 @@ func Defaults() *Config {
 			CoalesceWindow: Duration{200 * time.Millisecond},
 			PollInterval:   Duration{2 * time.Second},
 			SendTimeout:    Duration{0},
+			MaxRetries:     3,
+		},
+		GitLab: GitLabConfig{
+			BaseURL:        "https://gitlab.com",
+			Branch:         "main",
+			UpFile:         "packet-ab.txt",
+			DownFile:       "packet-ba.txt",
+			CoalesceWindow: Duration{200 * time.Millisecond},
+			PollInterval:   Duration{2 * time.Second},
 			MaxRetries:     3,
 		},
 		Client: ClientConfig{
