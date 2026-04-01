@@ -30,54 +30,19 @@ func (d Duration) MarshalYAML() (interface{}, error) { return d.String(), nil }
 
 // Config is the top-level structure read by both the client and server.
 type Config struct {
-	// Transport selects the carrier: "filepipe" (default), "wiki", "github",
-	// or "github_commit".
+	// Transport selects the carrier: "github" or "github_commit" (default).
 	Transport string `yaml:"transport"`
 	// Codec is the wire encoding shared by both sides: "base64" or "raw".
 	Codec string `yaml:"codec"`
 	// Debug enables verbose debug-level logging when true.
 	Debug bool `yaml:"debug"`
 
-	Pipe   PipeConfig   `yaml:"pipe"`
-	Wiki   WikiConfig   `yaml:"wiki"`
 	GitHub GitHubConfig `yaml:"github"`
 	Client ClientConfig `yaml:"client"`
 	Server ServerConfig `yaml:"server"`
 }
 
-// PipeConfig describes the two shared files used by FilePipeTransport.
-type PipeConfig struct {
-	Up          string   `yaml:"up"`           // client→server file path
-	Down        string   `yaml:"down"`         // server→client file path
-	SendTimeout Duration `yaml:"send_timeout"` // 0 = inherit from client/server Timeout
-	MaxRetries  int      `yaml:"max_retries"`
-}
-
-// WikiConfig describes the Wikipedia pages used by WikiTransport.
-type WikiConfig struct {
-	// UpPage is the MediaWiki page title for client→server data.
-	// e.g. "User:Pialechini/pipe-up"
-	UpPage string `yaml:"up_page"`
-	// DownPage is the MediaWiki page title for server→client data.
-	DownPage string `yaml:"down_page"`
-
-	// APIEndpoint is the MediaWiki API URL.
-	// e.g. "https://commons.wikimedia.org/w/api.php"
-	APIEndpoint string `yaml:"api_endpoint"`
-
-	// Cookies is the Cookie header string from a logged-in browser session.
-	// Copy it from browser DevTools → Network → any request → Cookie header.
-	Cookies string `yaml:"cookies"`
-
-	// PollInterval is how often each side checks a page for state changes.
-	PollInterval Duration `yaml:"poll_interval"`
-	// SendTimeout is how long to wait for the remote to consume a batch.
-	// 0 = inherit from client/server Timeout.
-	SendTimeout Duration `yaml:"send_timeout"`
-	MaxRetries  int      `yaml:"max_retries"`
-}
-
-// GitHubConfig describes the GitHub repository used by GitHubTransport.
+// GitHubConfig describes the GitHub repository used by the transport.
 type GitHubConfig struct {
 	// Owner is the GitHub username or organisation, e.g. "joejoe-am".
 	Owner string `yaml:"owner"`
@@ -93,25 +58,22 @@ type GitHubConfig struct {
 	DownBranch string `yaml:"down_branch"`
 
 	// UpFile is the repo-relative path for client→server data.
-	// e.g. "packet-ab.txt"
 	UpFile string `yaml:"up_file"`
 	// DownFile is the repo-relative path for server→client data.
-	// e.g. "packet-ba.txt"
 	DownFile string `yaml:"down_file"`
 
 	// Token is a GitHub Personal Access Token with repo scope.
 	Token string `yaml:"token"`
 
 	// CoalesceWindow is how long to accumulate packets before flushing.
-	// Larger values pack more data per commit; default 1400ms.
+	// Larger values pack more data per commit; default 200ms.
 	CoalesceWindow Duration `yaml:"coalesce_window"`
 
-	// PollInterval is how often to check the receive file for new data.
-	// Default: 2s.
+	// PollInterval is how often to check for incoming data. Default: 2s.
 	PollInterval Duration `yaml:"poll_interval"`
 
 	// SendTimeout is how long to wait for the remote to consume a batch.
-	// 0 = inherit from client/server Timeout.
+	// Only used by the "github" (ACK-based) transport. 0 = use client/server timeout.
 	SendTimeout Duration `yaml:"send_timeout"`
 
 	MaxRetries int `yaml:"max_retries"`
@@ -167,42 +129,12 @@ type ServerConfig struct {
 	Timeout Duration `yaml:"timeout"`
 }
 
-// ── Timeout helpers ───────────────────────────────────────────────────────────
-
-// EffectiveSendTimeout returns SendTimeout, falling back to fallback when zero.
-func (p PipeConfig) EffectiveSendTimeout(fallback Duration) time.Duration {
-	if p.SendTimeout.Duration != 0 {
-		return p.SendTimeout.Duration
-	}
-	return fallback.Duration
-}
-
-// EffectiveSendTimeout returns SendTimeout, falling back to fallback when zero.
-func (w WikiConfig) EffectiveSendTimeout(fallback Duration) time.Duration {
-	if w.SendTimeout.Duration != 0 {
-		return w.SendTimeout.Duration
-	}
-	return fallback.Duration
-}
-
 // ── Defaults & loading ────────────────────────────────────────────────────────
 
 func Defaults() *Config {
 	return &Config{
-		Transport: "filepipe",
+		Transport: "github_commit",
 		Codec:     "base64",
-		Pipe: PipeConfig{
-			Up:          "pipe/up.dat",
-			Down:        "pipe/down.dat",
-			SendTimeout: Duration{0},
-			MaxRetries:  3,
-		},
-		Wiki: WikiConfig{
-			APIEndpoint:  "https://commons.wikimedia.org/w/api.php",
-			PollInterval: Duration{3 * time.Second},
-			SendTimeout:  Duration{0},
-			MaxRetries:   3,
-		},
 		GitHub: GitHubConfig{
 			Branch:         "main",
 			UpFile:         "packet-ab.txt",

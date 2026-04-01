@@ -1,30 +1,31 @@
-# pwn – file-pipe tunnel
+# pwn
 
-A SOCKS5 proxy that tunnels traffic through two shared files instead of a direct network connection.
+A SOCKS5 proxy that tunnels TCP traffic through a GitHub repository.
+Neither side needs a direct network path to the other — all data travels as
+git commits.
 
 ```
 Browser / curl
      │ SOCKS5
      ▼
-  [client]  ──writes──►  pipe/up.dat   ──reads──►  [server]
-             ◄──reads──  pipe/down.dat  ◄──writes─       │
-                                                          │ TCP
-                                                    real destination
+  [client]  ──commits──►  GitHub repo  ──polls──►  [server]
+             ◄──polls───  GitHub repo  ◄──commits─      │
+                                                         │ TCP
+                                                   real destination
 ```
-
-Put the two pipe files on any shared storage — a network drive, a Dropbox/rclone folder, an S3-fuse mount, a USB stick — and neither side needs a direct network path to the other.
 
 ---
 
 ## Requirements
 
 - Go 1.21+
+- A GitHub repository with two branches and one file per branch
 
 ---
 
 ## Quick start
 
-**1. Clone and install dependencies**
+**1. Clone**
 
 ```bash
 git clone <repo>
@@ -32,129 +33,120 @@ cd pwn
 go mod download
 ```
 
-**2. Build both binaries**
+**2. Set up the GitHub repo**
+
+Create a repository and two branches:
 
 ```bash
-go build -o client ./cmd/client
-go build -o server ./cmd/server
+# In your relay repo (e.g. joejoe-am/fun-net)
+git checkout -b ab && echo "init" > packet-ab.txt && git add . && git commit -m "init" && git push origin ab
+git checkout -b ba && echo "init" > packet-ba.txt && git add . && git commit -m "init" && git push origin ba
 ```
 
-Or run without building:
+**3. Configure**
+
+Edit `config.yaml`:
+
+```yaml
+github:
+  owner: "your-username"
+  repo:  "your-repo"
+  up_branch:   "ab"           # client writes here
+  down_branch: "ba"           # server writes here
+  up_file:     "packet-ab.txt"
+  down_file:   "packet-ba.txt"
+  token:       "ghp_..."      # PAT with Contents: read & write
+```
+
+**4. Start the server** (machine with internet access)
 
 ```bash
-go run ./cmd/client
 go run ./cmd/server
 ```
 
-**3. Start the server** (on the machine with internet access)
+**5. Start the client** (restricted machine)
 
 ```bash
-./server
+go run ./cmd/client
 ```
 
-**4. Start the client** (on the restricted machine)
-
-```bash
-./client
-```
-
-**5. Use the SOCKS5 proxy**
+**6. Use the SOCKS5 proxy**
 
 ```bash
 curl --socks5 127.0.0.1:1080 https://example.com
-
-# or set it system-wide / in your browser:
-# Host: 127.0.0.1   Port: 1080   Type: SOCKS5
 ```
 
----
-
-## Configuration
-
-Edit `config.yaml` before starting either binary. The same file works for both sides — each binary reads only its own section.
-
-```yaml
-codec: base64          # base64 | raw  (must match on both sides)
-
-pipe:
-  up:   pipe/up.dat    # client writes / server reads
-  down: pipe/down.dat  # server writes / client reads
-  send_timeout: 0s     # 0s = inherit from client.timeout / server.timeout
-  max_retries: 3
-
-client:
-  listen: ":1080"      # SOCKS5 listen address
-  timeout: 30s
-
-server:
-  timeout: 30s
-```
-
-### Use a custom config file
-
-```bash
-./client -config /path/to/config.yaml
-./server -config /path/to/config.yaml
-```
-
-### Override any value on the command line
-
-CLI flags always win over the config file.
-
-```bash
-# Client
-./client -listen :8080
-./client -codec raw -timeout 1m
-./client -up /mnt/share/up.dat -down /mnt/share/down.dat
-
-# Server
-./server -codec raw
-./server -timeout 1m
-./server -up /mnt/share/up.dat -down /mnt/share/down.dat
-```
-
----
-
-## Codecs
-
-| Name | Description | Use when |
-|------|-------------|----------|
-| `base64` | Encodes every batch as printable ASCII | Carrier only supports text (HTTP form fields, log files, email …) |
-| `raw` | No transformation | Carrier is binary-safe (local filesystem, binary HTTP body …) |
-
-> Both sides **must** use the same codec.
-
----
-
-## How it works
-
-1. The client receives a SOCKS5 `CONNECT` request and creates a session.
-2. It batches all pending packets for all sessions into one file (`pipe/up.dat`), encoded with the configured codec.
-3. The server atomically renames `pipe/up.dat` (this rename is the ACK to the client) and reads the batch.
-4. The server dials the real destination, relays the data, and writes responses back to `pipe/down.dat`.
-5. The client picks up `pipe/down.dat` the same way and forwards data to the browser.
-
-At most **two files** exist at any moment. Each is capped at ~2 MB (filepipe
-only; the GitHub transport is bounded by GitHub's Contents API read limit of
-1 MB per file).
+Or set it in your browser: `Host: 127.0.0.1  Port: 1080  Type: SOCKS5`
 
 ---
 
 ## Transports
 
-The tunnel is not limited to the local filesystem. You can swap in any
-transport by setting `transport:` in `config.yaml` or with `-transport` on the
-command line:
+| Transport | How data travels | ACK required | API calls/hop |
+|---|---|---|---|
+| `github_commit` | Encoded batch in the **commit message** | No | 2 |
+| `github` | Encoded batch in the **file content**, ACK-based | Yes | 6 |
 
-| Transport | Carrier | Use when |
-|---|---|---|
-| `filepipe` | Local / shared filesystem | Both sides can mount the same directory |
-| `wiki` | GitHub Wiki API | Firewall allows outbound HTTPS to GitHub |
-| `github` | GitHub Contents API | Same as wiki; supports larger payloads |
+`github_commit` is the default. It is faster and uses fewer API calls.
+Large payloads (> 60 KB encoded) automatically fall back to storing data in
+the file content with a marker in the commit message.
 
-See **[docs/github-transport.md](docs/github-transport.md)** for a full
-explanation of how the GitHub transport works — the two-file state machine,
-coalescing window, ETag polling, blob SHA locking, and rate-limit handling.
+See **[docs/github-transport.md](docs/github-transport.md)** for a detailed
+explanation of both protocols.
+
+---
+
+## Configuration reference
+
+```yaml
+# Transport: "github_commit" (default) or "github"
+transport: github_commit
+
+# Wire encoding. Both sides must match.
+# "base64" is the only practical choice for GitHub transport.
+codec: base64
+
+# Verbose debug logging
+debug: false
+
+github:
+  owner:       "your-username"
+  repo:        "your-repo"
+  up_branch:   "ab"             # client writes (client→server)
+  down_branch: "ba"             # server writes (server→client)
+  up_file:     "packet-ab.txt"
+  down_file:   "packet-ba.txt"
+  token:       "ghp_..."
+  coalesce_window: 200ms        # batch window; increase for bulk transfers
+  poll_interval:   2s
+  max_retries:     3
+
+client:
+  listen:   ":1080"
+  timeout:  60s
+  # username: ""               # optional SOCKS5 auth (RFC 1929)
+  # password: ""
+  # max_conns: 64
+
+server:
+  timeout: 60s
+```
+
+### CLI flags
+
+```bash
+# Override any config value at runtime
+./client -listen :8080 -debug
+./client -transport github
+./server -codec base64 -debug
+```
+
+---
+
+## Cloudflare Workers deployment (server side)
+
+The server can also run as a Cloudflare Worker + Durable Object using
+`worker/relay.js`. See `worker/wrangler.toml` for deployment instructions.
 
 ---
 
@@ -162,19 +154,22 @@ coalescing window, ETag polling, blob SHA locking, and rate-limit handling.
 
 ```
 cmd/
-  client/main.go        # client entry point
-  server/main.go        # server entry point
+  client/main.go         # SOCKS5 proxy entry point
+  server/main.go         # relay entry point
 internal/
-  config/               # YAML config loading
-  packet/               # Packet struct and constants
-  transport/            # Transport + Codec interfaces, built-in codecs
-    filepipe/           # two-file filesystem transport
-    wiki/               # GitHub Wiki transport
-    github/             # GitHub Contents API transport
-  tunnel/               # session management and packet dispatch
-  proxy/                # SOCKS5 server
-  relay/                # TCP relay (server side)
+  config/                # YAML config loading
+  packet/                # Packet struct and flag constants
+  transport/             # Transport + Codec interfaces
+    github/              # GitHub Contents API transport (both variants)
+  tunnel/                # session management and packet dispatch
+  proxy/                 # SOCKS5 server (RFC 1928 + RFC 1929 auth)
+  relay/                 # TCP relay (server side)
+  netutil/               # TCP drain helper
+  logger/                # leveled logger
+worker/
+  relay.js               # Cloudflare Worker port of the server
+  wrangler.toml          # Worker deployment config
 docs/
-  github-transport.md   # detailed GitHub transport documentation
-config.yaml             # shared configuration
+  github-transport.md    # detailed transport documentation
+config.yaml              # shared configuration
 ```
